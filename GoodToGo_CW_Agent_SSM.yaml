@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  awsManagedPolicyParameterOne:      
+    Type: String
+    Default: arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+    Description: 'ARN of the first IAM Managed Policy to add to the role'
+  awseManagedPolicyParameterTwo:     
+    Type: String
+    Default: arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy
+    Description: 'ARN of the second IAM Managed Policy to add to the role'
+  awsManagedPolicyParameterThree: 
+    Type: String
+    Default: arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+    Description: 'ARN of the third IAM Managed Policy to add to the role'
+  SSMKey :
+    Description: Name of parameter store which contains the json configuration of CWAgent.
+    Type : String
+    Default: AmazonCloudWatch-linux
+
+Mappings: 
+  RegionMap: 
+    us-east-1: 
+      "HVM64": "ami-0ff8a91507f77f867"
+    us-west-1: 
+      "HVM64": "ami-0bdb828fd58c52235"
+    eu-west-1: 
+      "HVM64": "ami-047bb4163c506cd98"
+    ap-southeast-1: 
+      "HVM64": "ami-08569b978cc4dfa10"
+    ap-northeast-1: 
+      "HVM64": "ami-06cd52961ce9f0d85"
+    ca-central-1:
+      "HVM64": "ami-0277fbe7afa8a33a6"  
+
+
+Resources:
+  RootRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref awsManagedPolicyParameterOne     
+        - !Ref awseManagedPolicyParameterTwo    
+        - !Ref awsManagedPolicyParameterThree
+
+  RootInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref RootRole
+
+  myEC2Instance: 
+    Type: "AWS::EC2::Instance"
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - 01_setupCfnHup
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+          UpdateEnvironment:
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+        # Definition of a dummy file, that change the contents of the dummy file can trigger the agent to reload the configuration from SSM parameter store.
+        02_config-amazon-cloudwatch-agent:
+          files:
+            '/opt/aws/amazon-cloudwatch-agent/etc/dummy.version':
+              content: !Sub |
+                "You can change the VERSION below to to simulate the update of metadata"
+                "VERSION=1.0"
+        # Invoke amazon-cloudwatch-agent-ctl to restart the AmazonCloudWatchAgent.
+        03_restart_amazon-cloudwatch-agent:
+          commands:
+            01_stop_service:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop
+            02_start_service:
+              command:
+                Fn::Sub:
+                  - |
+                    sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c ssm:${ssmkey} -s
+                  - { ssmkey: !Ref SSMKey }
+        # Cfn-hup setting, it is to monitor the change of metadata.
+        # When there is change in the contents of json file in the metadata section, cfn-hup will call cfn-init to restart the AmazonCloudWatchAgent.
+        01_setupCfnHup:
+          files:
+             '/etc/cfn/cfn-hup.conf':
+               content: !Sub |
+                 [main]
+                 stack=${AWS::StackId}
+                 region=${AWS::Region}
+                 interval=1
+               mode: '000400'
+               owner: root
+               group: root
+             '/etc/cfn/hooks.d/amazon-cloudwatch-agent-auto-reloader.conf':
+               content: !Sub |
+                 [cfn-auto-reloader-hook]
+                 triggers=post.update
+                 path=Resources.EC2Instance.Metadata.AWS::CloudFormation::Init.02_config-amazon-cloudwatch-agent
+                 action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region} --configsets UpdateEnvironment
+                 runas=root
+               mode: '000400'
+               owner: root
+               group: root
+             "/lib/systemd/system/cfn-hup.service":
+                content: !Sub |
+                  [Unit]
+                  Description=cfn-hup daemon
+                  [Service]
+                  Type=simple
+                  ExecStart=/opt/aws/bin/cfn-hup
+                  Restart=always
+                  [Install]
+                  WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: !Sub |
+                systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: !Sub |
+                systemctl start cfn-hup.service
+
+    Properties: 
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", HVM64]
+      AvailabilityZone: ca-central-1a
+      InstanceType: t2.micro
+      KeyName: SOA
+      IamInstanceProfile: !Ref RootInstanceProfile
+      SecurityGroups: 
+        - !Ref ProdSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+               #!/bin/bash
+               rpm -Uvh https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+               sudo yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+               sudo yum install -y wget
+               sudo wget ftp://ftp.pbone.net/mirror/ftp5.gwdg.de/pub/opensuse/repositories/home:/bosconovic:/branches:/home:/elimat:/lsi/openSUSE_Leap_15.1/x86_64/libgcrypt11-1.5.4-lp151.23.29.x86_64.rpm
+               sudo yum install -y libgcrypt11-1.5.4-lp151.23.29.x86_64.rpm
+               sudo yum install -y collectd
+               sudo dnf install -y https://s3.ca-central-1.amazonaws.com/amazon-ssm-ca-central-1/latest/linux_amd64/amazon-ssm-agent.rpm
+               sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-linux
+               sudo /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region} --configsets default
+               sudo /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+            - { ssmkey: !Ref SSMKey }
+
+
+  ProdSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0
